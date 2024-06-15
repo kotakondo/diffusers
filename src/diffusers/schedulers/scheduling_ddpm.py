@@ -519,6 +519,37 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
         noisy_samples = sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
         return noisy_samples
 
+    def get_noise(
+        self,
+        noisy_samples: torch.FloatTensor,
+        original_samples: torch.FloatTensor,
+        timesteps: torch.IntTensor,
+    ) -> torch.FloatTensor:
+        
+        """
+        Recover original normalized noise from the noisy sample and the original sample.
+        """
+        
+        # Make sure alphas_cumprod and timestep have same device and dtype as original_samples
+        alphas_cumprod = self.alphas_cumprod.to(device=original_samples.device, dtype=original_samples.dtype)
+        timesteps = timesteps.to(original_samples.device)
+
+        sqrt_alpha_prod = alphas_cumprod[timesteps] ** 0.5
+        sqrt_alpha_prod = sqrt_alpha_prod.flatten()
+        while len(sqrt_alpha_prod.shape) < len(original_samples.shape):
+            sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
+
+        sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timesteps]) ** 0.5
+        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
+        while len(sqrt_one_minus_alpha_prod.shape) < len(original_samples.shape):
+            sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
+
+        # noisy_samples = sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
+            
+        # Recover original noise
+        noise = (noisy_samples - sqrt_alpha_prod * original_samples) / sqrt_one_minus_alpha_prod
+        return noise
+
     def get_velocity(
         self, sample: torch.FloatTensor, noise: torch.FloatTensor, timesteps: torch.IntTensor
     ) -> torch.FloatTensor:
@@ -556,3 +587,87 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
             prev_t = timestep - self.config.num_train_timesteps // num_inference_steps
 
         return prev_t
+
+    def get_new_G_and_h(
+        self,
+        model_output: torch.FloatTensor,
+        timestep: int,
+        sample: torch.FloatTensor,
+        G: torch.FloatTensor,
+        h: torch.FloatTensor,
+    ):
+        """
+        Predict the sample from the previous timestep by reversing the SDE. This function propagates the diffusion
+        process from the learned model outputs (most often the predicted noise).
+
+        Args:
+            model_output (`torch.FloatTensor`):
+                The direct output from learned diffusion model.
+            timestep (`float`):
+                The current discrete timestep in the diffusion chain.
+            sample (`torch.FloatTensor`):
+                A current instance of a sample created by the diffusion process.
+            generator (`torch.Generator`, *optional*):
+                A random number generator.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~schedulers.scheduling_ddpm.DDPMSchedulerOutput`] or `tuple`.
+
+        Returns:
+            [`~schedulers.scheduling_ddpm.DDPMSchedulerOutput`] or `tuple`:
+                If return_dict is `True`, [`~schedulers.scheduling_ddpm.DDPMSchedulerOutput`] is returned, otherwise a
+                tuple is returned where the first element is the sample tensor.
+
+        """
+        t = timestep
+
+        prev_t = self.previous_timestep(t)
+
+        # if model_output.shape[1] == sample.shape[1] * 2 and self.variance_type in ["learned", "learned_range"]:
+        #     model_output, predicted_variance = torch.split(model_output, sample.shape[1], dim=1)
+        # else:
+        #     predicted_variance = None
+
+        # 1. compute alphas, betas
+        alpha_prod_t = self.alphas_cumprod[t]
+        alpha_prod_t_prev = self.alphas_cumprod[prev_t] if prev_t >= 0 else self.one
+        beta_prod_t = 1 - alpha_prod_t
+        beta_prod_t_prev = 1 - alpha_prod_t_prev
+        current_alpha_t = alpha_prod_t / alpha_prod_t_prev
+        current_beta_t = 1 - current_alpha_t
+
+        # 2. compute predicted original sample from predicted noise also called
+        # "predicted x_0" of formula (15) from https://arxiv.org/pdf/2006.11239.pdf
+        if self.config.prediction_type == "epsilon":
+            pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+        elif self.config.prediction_type == "sample":
+            pred_original_sample = model_output
+        elif self.config.prediction_type == "v_prediction":
+            pred_original_sample = (alpha_prod_t**0.5) * sample - (beta_prod_t**0.5) * model_output
+        else:
+            raise ValueError(
+                f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample` or"
+                " `v_prediction`  for the DDPMScheduler."
+            )
+
+        # # 3. Clip or threshold "predicted x_0"
+        # if self.config.thresholding:
+        #     pred_original_sample = self._threshold_sample(pred_original_sample)
+        # elif self.config.clip_sample:
+        #     pred_original_sample = pred_original_sample.clamp(
+        #         -self.config.clip_sample_range, self.config.clip_sample_range
+        #     )
+
+        # 4. Compute coefficients for pred_original_sample x_0 and current sample x_t
+        # See formula (7) from https://arxiv.org/pdf/2006.11239.pdf
+        pred_original_sample_coeff = (alpha_prod_t_prev ** (0.5) * current_beta_t) / beta_prod_t
+        current_sample_coeff = current_alpha_t ** (0.5) * beta_prod_t_prev / beta_prod_t
+
+        # 5. Compute predicted previous sample µ_t
+        # See formula (7) from https://arxiv.org/pdf/2006.11239.pdf
+        pred_prev_sample = pred_original_sample_coeff * pred_original_sample + current_sample_coeff * sample
+
+        # Get new G and new h
+        new_G = -G * pred_original_sample_coeff * beta_prod_t ** 0.5 / alpha_prod_t ** 0.5
+        new_h = h - (pred_original_sample_coeff / alpha_prod_t ** 0.5 + current_sample_coeff) * G @ sample[0] # sample shape is [1, 30] so smaple[0]
+
+        return new_G, new_h
